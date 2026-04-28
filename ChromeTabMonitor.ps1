@@ -2,16 +2,28 @@
 # Run this alongside ThermalMonitor.ps1 to identify problematic Chrome tabs
 # Requirements: Run as Administrator for full process access
 
+[CmdletBinding()]
 param(
     [ValidateRange(1, 300)]
     [int]$RefreshInterval = 5,   # Refresh every N seconds (1-300 seconds allowed)
+    [ValidateRange(1, 1000)]
     [int]$TopProcessCount = 10,   # Show top N processes
     [switch]$ShowAll = $false,    # Show all Chrome processes instead of just top ones
+    [ValidateRange(0, 100)]
     [int]$HighCpuThreshold = 1,   # CPU % threshold for highlighting
+    [ValidateRange(1, 1048576)]
     [int]$HighMemoryThreshold = 100, # Memory (MB) threshold for highlighting
     [switch]$ExportToCsv = $false,
     [string]$ExportPath = $(Join-Path -Path (Get-Location) -ChildPath ("ChromeAnalysis_" + (Get-Date -Format 'yyyyMMdd_HHmmss') + ".csv"))
 )
+
+$script:ChromeCommandLineCache = @{}
+
+function Test-IsAdministrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
 
 # Function to get Chrome process type from command line
 function Get-ChromeProcessType {
@@ -112,17 +124,69 @@ function Format-FileSize {
 function Get-ChromeProcessDetails {
     try {
         $chromeProcesses = Get-Process -Name "chrome" -ErrorAction SilentlyContinue
-        if (-not $chromeProcesses) { return $null }
+        if (-not $chromeProcesses) {
+            $script:ChromeCommandLineCache.Clear()
+            return $null
+        }
 
-        # Batch WMI/CIM query for performance
-        $wmiProcesses = Get-CimInstance -Query "SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name='chrome.exe'" -ErrorAction SilentlyContinue
-        $wmiByPid = @{}
-        foreach ($w in ($wmiProcesses | Where-Object { $_ })) { $wmiByPid[[int]$w.ProcessId] = $w }
+        $currentProcessIds = @{}
+        $processStartTimeByPid = @{}
+        foreach ($proc in $chromeProcesses) {
+            $processId = [int]$proc.Id
+            $currentProcessIds[$processId] = $true
+            try {
+                $processStartTimeByPid[$processId] = $proc.StartTime
+            } catch {
+                $processStartTimeByPid[$processId] = $null
+            }
+        }
+
+        foreach ($cachedProcessId in @($script:ChromeCommandLineCache.Keys)) {
+            if (-not $currentProcessIds.ContainsKey([int]$cachedProcessId)) {
+                $script:ChromeCommandLineCache.Remove([int]$cachedProcessId)
+            }
+        }
+
+        $missingProcessIds = @()
+        foreach ($processId in $currentProcessIds.Keys) {
+            $startTime = $processStartTimeByPid[$processId]
+            $startTicks = if ($null -ne $startTime) { $startTime.ToUniversalTime().Ticks } else { $null }
+            if (-not $script:ChromeCommandLineCache.ContainsKey($processId) -or $script:ChromeCommandLineCache[$processId].StartTicks -ne $startTicks) {
+                $missingProcessIds += $processId
+            }
+        }
+
+        if ($missingProcessIds.Count -gt 0) {
+            $pidFilter = ($missingProcessIds | ForEach-Object { "ProcessId=$_" }) -join " OR "
+            $query = "SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name='chrome.exe' AND ($pidFilter)"
+            $wmiProcesses = Get-CimInstance -Query $query -ErrorAction SilentlyContinue
+
+            foreach ($wmiProcess in ($wmiProcesses | Where-Object { $_ })) {
+                $processId = [int]$wmiProcess.ProcessId
+                $startTime = $processStartTimeByPid[$processId]
+                $startTicks = if ($null -ne $startTime) { $startTime.ToUniversalTime().Ticks } else { $null }
+                $script:ChromeCommandLineCache[$processId] = [PSCustomObject]@{
+                    StartTicks = $startTicks
+                    CommandLine = [string]$wmiProcess.CommandLine
+                }
+            }
+
+            foreach ($processId in $missingProcessIds) {
+                if (-not $script:ChromeCommandLineCache.ContainsKey($processId)) {
+                    $startTime = $processStartTimeByPid[$processId]
+                    $startTicks = if ($null -ne $startTime) { $startTime.ToUniversalTime().Ticks } else { $null }
+                    $script:ChromeCommandLineCache[$processId] = [PSCustomObject]@{
+                        StartTicks = $startTicks
+                        CommandLine = ""
+                    }
+                }
+            }
+        }
 
         # Snapshot CPU usage by PID using perf counters
         $pidCpu = Get-PerfCpuSnapshot
 
-        $chromeDetails = @()
+        $chromeDetails = [System.Collections.Generic.List[object]]::new()
         $totalChromeProcesses = $chromeProcesses.Count
         $processedCount = 0
         Write-Progress -Activity "Analyzing Chrome Processes" -Status "Starting..." -PercentComplete 0
@@ -134,21 +198,21 @@ function Get-ChromeProcessDetails {
             
             try {
                 $processId = [int]$proc.Id
-                $wmiProc = if ($wmiByPid.ContainsKey($processId)) { $wmiByPid[$processId] } else { $null }
-                $commandLine = if ($wmiProc) { $wmiProc.CommandLine } else { "" }
+                $commandLine = if ($script:ChromeCommandLineCache.ContainsKey($processId)) { $script:ChromeCommandLineCache[$processId].CommandLine } else { "" }
+                $processStartTime = $processStartTimeByPid[$processId]
 
                 $typeInfo = Get-ChromeProcessType -CommandLine $commandLine
                 $cpuUsage = if ($pidCpu.ContainsKey($processId)) { $pidCpu[$processId] } else { Get-ProcessCpuUsage -Process $proc }
 
                 # Runtime formatting
-                $runtime = if ($proc.StartTime) { (Get-Date) - $proc.StartTime } else { New-TimeSpan }
+                $runtime = if ($null -ne $processStartTime) { (Get-Date) - $processStartTime } else { New-TimeSpan }
                 $runtimeText = if ($runtime.TotalHours -ge 1) {
                     "$([math]::Floor($runtime.TotalHours)):$($runtime.Minutes.ToString('00')):$($runtime.Seconds.ToString('00'))"
                 } else {
                     "$($runtime.Minutes):$($runtime.Seconds.ToString('00'))"
                 }
 
-                $chromeDetails += [PSCustomObject]@{
+                [void]$chromeDetails.Add([PSCustomObject]@{
                     Timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
                     PID = $processId
                     Type = $typeInfo.Type
@@ -160,11 +224,11 @@ function Get-ChromeProcessDetails {
                     Threads = $proc.Threads.Count
                     Handles = $proc.HandleCount
                     Runtime = $runtimeText
-                    'Start Time' = if ($proc.StartTime) { $proc.StartTime.ToString("HH:mm:ss") } else { "Unknown" }
+                    'Start Time' = if ($null -ne $processStartTime) { $processStartTime.ToString("HH:mm:ss") } else { "Unknown" }
                     'Command Preview' = if ($commandLine.Length -gt 120) { $commandLine.Substring(0, 117) + "..." } else { $commandLine }
-                }
+                })
             } catch [System.UnauthorizedAccessException] {
-                $chromeDetails += [PSCustomObject]@{
+                [void]$chromeDetails.Add([PSCustomObject]@{
                     Timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
                     PID = $proc.Id
                     Type = "Unknown (No Access)"
@@ -178,7 +242,7 @@ function Get-ChromeProcessDetails {
                     Runtime = ""
                     'Start Time' = ""
                     'Command Preview' = ""
-                }
+                })
             } catch {
                 Write-Verbose "Could not access process PID $($proc.Id): $_"
             }
@@ -210,121 +274,133 @@ Write-Host "CPU Threshold: $HighCpuThreshold% | Memory Threshold: $HighMemoryThr
 Write-Host "Press Ctrl+C to exit" -ForegroundColor Gray
 Write-Host ""
 
+if (-not (Test-IsAdministrator)) {
+    Write-Warning "Not running as Administrator. Some Chrome process details may be unavailable."
+}
+
 $iteration = 0
 
-while ($true) {
-    $iteration++
-    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    
-    # Periodic GC to keep memory use stable for long sessions
-    if ($iteration % 100 -eq 0) {
-        [System.GC]::Collect()
-        [System.GC]::WaitForPendingFinalizers()
-    }
-    
-    # Clear screen and show header
-    if ($iteration -gt 1) { Clear-Host }
-    
-    Write-Host "Chrome Process Monitor - $timestamp (Iteration: $iteration)" -ForegroundColor Green
-    Write-Host ("=" * 80) -ForegroundColor Green
-    
-    try {
-        $chromeData = Get-ChromeProcessDetails
+try {
+    while ($true) {
+        $iteration++
+        $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
         
-        if ($chromeData) {
-            $totalProcesses = $chromeData.Count
-            $totalMemoryMB = [math]::Round(($chromeData | Measure-Object MemoryMB -Sum).Sum, 1)
-            $totalCPU = [math]::Round(($chromeData | Measure-Object 'CPU%' -Sum).Sum, 2)
-            
-            Write-Host ""
-            Write-Host "CHROME OVERVIEW:" -ForegroundColor Yellow
-            Write-Host "  Total Processes: $totalProcesses | Total CPU: $totalCPU% | Total Memory: $totalMemoryMB MB" -ForegroundColor White
-            
-            # Show high CPU processes
-            $highCpuProcesses = $chromeData | Where-Object { $_.'CPU%' -gt $HighCpuThreshold }
-            if ($highCpuProcesses) {
-                Write-Host ""
-                Write-Host "HIGH CPU PROCESSES (>$HighCpuThreshold% CPU):" -ForegroundColor Red
-                $displayCount = if ($ShowAll) { $highCpuProcesses.Count } else { [math]::Min($TopProcessCount, $highCpuProcesses.Count) }
-                $highCpuProcesses | Select-Object -First $displayCount | 
-                    Format-Table PID, Type, Info, 'CPU%', Memory, Threads, Runtime, 'Start Time' -AutoSize
-            }
-            
-            # Show high memory processes
-            $highMemProcesses = $chromeData | Where-Object { $_.MemoryMB -gt $HighMemoryThreshold } | Sort-Object MemoryMB -Descending
-            if ($highMemProcesses) {
-                Write-Host ""
-                Write-Host "HIGH MEMORY PROCESSES (>$HighMemoryThreshold MB):" -ForegroundColor Magenta
-                $displayCount = if ($ShowAll) { $highMemProcesses.Count } else { [math]::Min($TopProcessCount, $highMemProcesses.Count) }
-                $highMemProcesses | Select-Object -First $displayCount | 
-                    Format-Table PID, Type, Info, 'CPU%', Memory, 'Peak Memory', Handles, Runtime -AutoSize
-            }
-            
-            # Group by type summary
-            Write-Host ""
-            Write-Host "SUMMARY BY PROCESS TYPE:" -ForegroundColor Yellow
-            $typeGroups = $chromeData | Group-Object Type | Sort-Object { ($_.Group | Measure-Object 'CPU%' -Sum).Sum } -Descending
-            
-            foreach ($group in $typeGroups) {
-                $groupCPU = [math]::Round(($group.Group | Measure-Object 'CPU%' -Sum).Sum, 2)
-                $groupMem = [math]::Round(($group.Group | Measure-Object MemoryMB -Sum).Sum, 1)
-                $avgCPU = [math]::Round(($group.Group | Measure-Object 'CPU%' -Average).Average, 2)
-                
-                $color = if ($groupCPU -gt 10) { "Red" } elseif ($groupCPU -gt 5) { "Yellow" } else { "White" }
-                Write-Host "  $($group.Name): " -NoNewline -ForegroundColor $color
-                Write-Host "$($group.Count) processes | Total CPU: $groupCPU% | Total Memory: $groupMem MB | Avg CPU: $avgCPU%" -ForegroundColor Gray
-            }
-            
-            # Show Chrome built-in tools reminder
-            Write-Host ""
-            Write-Host "CHROME BUILT-IN TOOLS:" -ForegroundColor Green
-            Write-Host "  Shift+Esc           - Chrome Task Manager (match PIDs with tabs)" -ForegroundColor White
-            Write-Host "  chrome://system/    - Detailed system information" -ForegroundColor White
-            Write-Host "  chrome://discards/  - Tab resource usage and importance" -ForegroundColor White
-            Write-Host "  chrome://process-internals/ - Process breakdown" -ForegroundColor White
-            Write-Host "  chrome://memory-internals/  - Memory usage details" -ForegroundColor White
-            
-            # Show top problematic processes (fixed higher thresholds)
-            $problematicProcesses = $chromeData | Where-Object { $_.'CPU%' -gt ([math]::Max($HighCpuThreshold, 5)) -or $_.MemoryMB -gt ([math]::Max($HighMemoryThreshold, 200)) }
-            if ($problematicProcesses) {
-                Write-Host ""
-                Write-Host "ATTENTION: High Resource Usage Detected!" -ForegroundColor Red
-                Write-Host "The following Chrome processes may need investigation:" -ForegroundColor Yellow
-                foreach ($proc in ($problematicProcesses | Select-Object -First 3)) {
-                    Write-Host "  PID $($proc.PID) ($($proc.Type)): $($proc.'CPU%')% CPU, $($proc.Memory) Memory" -ForegroundColor Red
-                }
-            }
-
-            # Optional export to CSV
-            if ($ExportToCsv) {
-                try {
-                    $exportDir = Split-Path -Parent $ExportPath
-                    if ($exportDir -and -not (Test-Path $exportDir)) {
-                        New-Item -ItemType Directory -Path $exportDir -Force | Out-Null
-                    }
-                    $chromeData | Select-Object Timestamp, PID, Type, Info, 'CPU%', MemoryMB, Threads, Handles, Runtime, 'Start Time' |
-                        Export-Csv -Path $ExportPath -Append -NoTypeInformation
-                    Write-Host "Data appended to: $ExportPath" -ForegroundColor Gray
-                } catch {
-                    Write-Host "Failed to export CSV: $_" -ForegroundColor Yellow
-                }
-            }
-            
-        } else {
-            Write-Host ""
-            Write-Host "No Chrome processes found" -ForegroundColor Gray
-            Write-Host "Chrome may not be running or may not be accessible" -ForegroundColor Gray
+        # Periodic GC to keep memory use stable for long sessions
+        if ($iteration % 100 -eq 0) {
+            [System.GC]::Collect()
+            [System.GC]::WaitForPendingFinalizers()
         }
         
-    } catch {
+        # Clear screen and show header
+        if ($iteration -gt 1) { Clear-Host }
+        
+        Write-Host "Chrome Process Monitor - $timestamp (Iteration: $iteration)" -ForegroundColor Green
+        Write-Host ("=" * 80) -ForegroundColor Green
+        
+        try {
+            $chromeData = Get-ChromeProcessDetails
+            
+            if ($chromeData) {
+                $totalProcesses = $chromeData.Count
+                $totalMemoryMB = [math]::Round(($chromeData | Measure-Object MemoryMB -Sum).Sum, 1)
+                $totalCPU = [math]::Round(($chromeData | Measure-Object 'CPU%' -Sum).Sum, 2)
+                
+                Write-Host ""
+                Write-Host "CHROME OVERVIEW:" -ForegroundColor Yellow
+                Write-Host "  Total Processes: $totalProcesses | Total CPU: $totalCPU% | Total Memory: $totalMemoryMB MB" -ForegroundColor White
+                
+                # Show high CPU processes
+                $highCpuProcesses = $chromeData | Where-Object { $_.'CPU%' -gt $HighCpuThreshold }
+                if ($highCpuProcesses) {
+                    Write-Host ""
+                    Write-Host "HIGH CPU PROCESSES (>$HighCpuThreshold% CPU):" -ForegroundColor Red
+                    $displayCount = if ($ShowAll) { $highCpuProcesses.Count } else { [math]::Min($TopProcessCount, $highCpuProcesses.Count) }
+                    $highCpuProcesses | Select-Object -First $displayCount | 
+                        Format-Table PID, Type, Info, 'CPU%', Memory, Threads, Runtime, 'Start Time' -AutoSize
+                }
+                
+                # Show high memory processes
+                $highMemProcesses = $chromeData | Where-Object { $_.MemoryMB -gt $HighMemoryThreshold } | Sort-Object MemoryMB -Descending
+                if ($highMemProcesses) {
+                    Write-Host ""
+                    Write-Host "HIGH MEMORY PROCESSES (>$HighMemoryThreshold MB):" -ForegroundColor Magenta
+                    $displayCount = if ($ShowAll) { $highMemProcesses.Count } else { [math]::Min($TopProcessCount, $highMemProcesses.Count) }
+                    $highMemProcesses | Select-Object -First $displayCount | 
+                        Format-Table PID, Type, Info, 'CPU%', Memory, 'Peak Memory', Handles, Runtime -AutoSize
+                }
+                
+                # Group by type summary
+                Write-Host ""
+                Write-Host "SUMMARY BY PROCESS TYPE:" -ForegroundColor Yellow
+                $typeGroups = $chromeData | Group-Object Type | Sort-Object { ($_.Group | Measure-Object 'CPU%' -Sum).Sum } -Descending
+                
+                foreach ($group in $typeGroups) {
+                    $groupCPU = [math]::Round(($group.Group | Measure-Object 'CPU%' -Sum).Sum, 2)
+                    $groupMem = [math]::Round(($group.Group | Measure-Object MemoryMB -Sum).Sum, 1)
+                    $avgCPU = [math]::Round(($group.Group | Measure-Object 'CPU%' -Average).Average, 2)
+                    
+                    $color = if ($groupCPU -gt 10) { "Red" } elseif ($groupCPU -gt 5) { "Yellow" } else { "White" }
+                    Write-Host "  $($group.Name): " -NoNewline -ForegroundColor $color
+                    Write-Host "$($group.Count) processes | Total CPU: $groupCPU% | Total Memory: $groupMem MB | Avg CPU: $avgCPU%" -ForegroundColor Gray
+                }
+                
+                # Show Chrome built-in tools reminder
+                Write-Host ""
+                Write-Host "CHROME BUILT-IN TOOLS:" -ForegroundColor Green
+                Write-Host "  Shift+Esc           - Chrome Task Manager (match PIDs with tabs)" -ForegroundColor White
+                Write-Host "  chrome://system/    - Detailed system information" -ForegroundColor White
+                Write-Host "  chrome://discards/  - Tab resource usage and importance" -ForegroundColor White
+                Write-Host "  chrome://process-internals/ - Process breakdown" -ForegroundColor White
+                Write-Host "  chrome://memory-internals/  - Memory usage details" -ForegroundColor White
+                
+                # Show top problematic processes (fixed higher thresholds)
+                $problematicProcesses = $chromeData | Where-Object { $_.'CPU%' -gt ([math]::Max($HighCpuThreshold, 5)) -or $_.MemoryMB -gt ([math]::Max($HighMemoryThreshold, 200)) }
+                if ($problematicProcesses) {
+                    Write-Host ""
+                    Write-Host "ATTENTION: High Resource Usage Detected!" -ForegroundColor Red
+                    Write-Host "The following Chrome processes may need investigation:" -ForegroundColor Yellow
+                    foreach ($proc in ($problematicProcesses | Select-Object -First 3)) {
+                        Write-Host "  PID $($proc.PID) ($($proc.Type)): $($proc.'CPU%')% CPU, $($proc.Memory) Memory" -ForegroundColor Red
+                    }
+                }
+
+                # Optional export to CSV
+                if ($ExportToCsv) {
+                    try {
+                        $exportDir = Split-Path -Parent $ExportPath
+                        if ($exportDir -and -not (Test-Path $exportDir)) {
+                            New-Item -ItemType Directory -Path $exportDir -Force | Out-Null
+                        }
+                        $chromeData | Select-Object Timestamp, PID, Type, Info, 'CPU%', MemoryMB, Threads, Handles, Runtime, 'Start Time' |
+                            Export-Csv -Path $ExportPath -Append -NoTypeInformation
+                        Write-Host "Data appended to: $ExportPath" -ForegroundColor Gray
+                    } catch {
+                        Write-Host "Failed to export CSV: $_" -ForegroundColor Yellow
+                    }
+                }
+                
+            } else {
+                Write-Host ""
+                Write-Host "No Chrome processes found" -ForegroundColor Gray
+                Write-Host "Chrome may not be running or may not be accessible" -ForegroundColor Gray
+            }
+            
+        } catch {
+            Write-Host ""
+            Write-Host "Error analyzing Chrome processes: $_" -ForegroundColor Red
+            Write-Host "Make sure you're running PowerShell as Administrator" -ForegroundColor Yellow
+        }
+        
         Write-Host ""
-        Write-Host "Error analyzing Chrome processes: $_" -ForegroundColor Red
-        Write-Host "Make sure you're running PowerShell as Administrator" -ForegroundColor Yellow
+        Write-Host "Next refresh in $RefreshInterval seconds... (Press Ctrl+C to exit)" -ForegroundColor Gray
+        Write-Host ("=" * 80) -ForegroundColor Green
+        
+        Start-Sleep -Seconds $RefreshInterval
     }
-    
-    Write-Host ""
-    Write-Host "Next refresh in $RefreshInterval seconds... (Press Ctrl+C to exit)" -ForegroundColor Gray
-    Write-Host ("=" * 80) -ForegroundColor Green
-    
-    Start-Sleep -Seconds $RefreshInterval
+} finally {
+    Write-Progress -Activity "Analyzing Chrome Processes" -Completed
+    if ($ExportToCsv) {
+        Write-Host ""
+        Write-Host "CSV export path: $ExportPath" -ForegroundColor Gray
+    }
 }
