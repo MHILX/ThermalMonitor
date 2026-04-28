@@ -5,7 +5,7 @@ A comprehensive PowerShell toolkit for monitoring and diagnosing system thermal 
 - **ThermalMonitor.ps1**: Main system thermal monitoring with CPU/GPU usage, temperatures, and thermal throttling detection
 - **ChromeTabMonitor.ps1**: Real-time Chrome process analysis to identify resource-heavy tabs and extensions
 
-Helps identify resource-heavy processes contributing to overheating. Optional integration with Open Hardware Monitor for enhanced temperature data. Ideal for diagnosing performance issues and Chrome-specific resource consumption.
+Helps identify resource-heavy processes and system-level signals contributing to overheating. Optional integration with LibreHardwareMonitor or Open Hardware Monitor adds stronger temperature, CPU package power, and fan data. Ideal for diagnosing performance issues and Chrome-specific resource consumption.
 
 ---
 
@@ -13,18 +13,21 @@ Helps identify resource-heavy processes contributing to overheating. Optional in
 
 - **Logs Data:** Saves output to a log file in `C:\Temp` with a timestamped filename (e.g., `ThermalMonitor_20250722_083512.log`).
 - **CPU Usage:** Uses performance counters to get real-time CPU usage percentage for the top 10 processes, with intelligent aggregation of multiple process instances and fallback to CPU time if counters aren't available.
-- **GPU Usage:** Attempts to retrieve GPU engine utilization using Windows performance counters with proper process name parsing and aggregation (availability varies by system and GPU).
-- **CPU Temperature:** Tries Open Hardware Monitor first with silent fallback to Windows built-in thermal zones. Includes temperature averaging and validation. Displays temperatures in both Celsius and Fahrenheit for convenience.
+- **GPU Usage:** Attempts to retrieve GPU engine utilization using Windows performance counters, resolves GPU counter PIDs back to process names, and aggregates utilization by process (availability varies by system and GPU).
+- **CPU Performance Scaling:** Uses Windows `Processor Information` counters to log processor performance and maximum-frequency percentage, which is more useful for throttling detection than WMI clock speed alone.
+- **Kernel/Driver Activity:** Logs DPC and interrupt time to flag possible device-driver or kernel-side heat causes that may not show up as a normal app process.
+- **Disk and Network Activity:** Tracks total disk/network throughput and per-process I/O rates to expose sustained storage or network work that can contribute to heat.
+- **CPU Temperature:** Tries LibreHardwareMonitor first, then Open Hardware Monitor, then Windows built-in thermal zones. Includes temperature averaging and validation. Displays temperatures in both Celsius and Fahrenheit for convenience.
 - **Process Tracking:** Maintains historical data for each process across all monitoring cycles to identify sustained heat sources.
-- **Heat Analysis:** Calculates a "heat score" for each process based on average CPU usage, peak usage, memory consumption, and time presence to identify the most likely culprits.
-- **Thermal Throttling Detection:** Compares current CPU clock speed to max clock speed and tracks throttling events throughout monitoring.
+- **Heat Analysis:** Calculates a "heat score" for each process based on sustained CPU usage, GPU usage, process I/O, peak usage, memory consumption, and time presence to identify the most likely culprits.
+- **Thermal Throttling Detection:** Combines CPU performance counters, WMI clock speed, CPU load, and temperature evidence before classifying likely thermal throttling.
 - **Monitoring Loop:** Runs for 5 minutes, checking every 10 seconds, and logs all data with real-time warnings for high temperatures and throttling.
 - **Visual Feedback:** Displays progress bars, spinning animations, colored status messages, and a comprehensive heat analysis report at the end.
 
 ## Prerequisites
 
 - **Run as Administrator:** Performance counters and some WMI queries require elevated privileges. Right-click PowerShell and select "Run as Administrator."
-- **Open Hardware Monitor (Optional):** For enhanced temperature data, download and run Open Hardware Monitor before executing the script. The script will attempt to use Windows built-in thermal sensors as fallback.
+- **LibreHardwareMonitor or Open Hardware Monitor (Optional):** For enhanced temperature, CPU package power, and fan data, download and run LibreHardwareMonitor or Open Hardware Monitor before executing the script. The script will attempt to use Windows built-in thermal sensors as fallback.
 - **Windows 10/11:** GPU performance counters work best on modern Windows versions with supported GPUs and drivers.
 
 ## How to Use
@@ -64,21 +67,27 @@ Helps identify resource-heavy processes contributing to overheating. Optional in
 #### Heat Analysis Report
 The script automatically generates a comprehensive heat analysis report at the end, ranking processes by their "heat score":
 
-- **Heat Score Calculation:** Combines sustained CPU load (average CPU × time present), peak CPU impact, and memory pressure
+- **Heat Score Calculation:** Combines sustained CPU load (average CPU × time present), sustained GPU load, process I/O activity, peak CPU/GPU impact, and memory pressure
 - **Top Heat Culprits:** Shows the top 5 processes most likely responsible for system heating
-- **Process Metrics:** Displays average CPU usage, maximum CPU usage, memory consumption, and percentage of time the process was active
+- **Process Metrics:** Displays average CPU usage, maximum CPU usage, GPU usage, process I/O, memory consumption, and percentage of time the process was active
 - **Color Coding:** Red indicates high heat scores (>50), yellow indicates moderate scores (>25)
 
 ### Temperature Analysis
 - **Temperature Averaging:** Shows average and maximum temperatures throughout the monitoring period in both Celsius and Fahrenheit
+- **Power and Fan Data:** Shows CPU package power and fan RPM when exposed by LibreHardwareMonitor or Open Hardware Monitor
 - **High Temperature Warnings:** Alerts when temperatures exceed 85°C (185°F)
-- **Multiple Sources:** Uses Open Hardware Monitor data when available, falls back to Windows thermal zones
+- **Multiple Sources:** Uses LibreHardwareMonitor or Open Hardware Monitor data when available, falls back to Windows thermal zones
 - **Dual Scale Display:** All temperature readings are shown in both °C and °F for user convenience
 
 ### Throttling Detection
-- **Real-time Monitoring:** Tracks CPU clock speed changes throughout monitoring
+- **Real-time Monitoring:** Tracks CPU performance scaling and clock speed changes throughout monitoring
 - **Throttling Events:** Reports frequency and percentage of time throttling occurred
-- **Performance Impact:** Shows current vs maximum clock speeds to assess throttling severity
+- **Performance Impact:** Shows processor performance/frequency percentage plus current vs maximum clock speeds to assess throttling severity
+
+### System Signals
+- **Driver/Kernel Activity:** Summarizes DPC and interrupt time, which can indicate driver or device-related heat when no app stands out
+- **Storage Activity:** Summarizes disk throughput and per-process I/O rates
+- **Network Activity:** Summarizes network throughput, useful for workloads that keep Wi-Fi or adapters active
 
 ### ChromeTabMonitor.ps1 Results
 
@@ -105,6 +114,9 @@ When enabled, exports timestamped data including all process metrics for histori
 ### ThermalMonitor.ps1 Features
 - **Process Instance Aggregation:** Handles multiple instances of the same process (e.g., chrome#1, chrome#2) by combining their resource usage
 - **Smart GPU Detection:** Automatically detects Windows version compatibility for GPU monitoring (requires Windows 10 build 17763+)
+- **CPU Scaling Counters:** Uses processor performance/frequency counters to reduce false throttling conclusions from WMI clock speed alone
+- **DPC/Interrupt Diagnostics:** Flags elevated kernel activity that may point to drivers, external devices, or firmware behavior
+- **I/O Heat Signals:** Tracks total disk throughput and process I/O data rates as additional heat contributors
 - **Enhanced Error Handling:** Graceful fallbacks when performance counters or temperature sensors are unavailable
 - **Sustained Load Analysis:** Focuses on processes that consistently consume resources over time rather than brief spikes
 - **Memory Pressure Consideration:** Includes memory usage in heat calculations as high memory usage can contribute to thermal load
@@ -123,7 +135,7 @@ When enabled, exports timestamped data including all process metrics for histori
 ### ThermalMonitor.ps1 Customization
 - **Duration:** Modify `$monitorDuration` (default: 300 seconds) to change monitoring time
 - **Interval:** Adjust `$interval` (default: 10 seconds) to change sampling frequency
-- **Process Count:** The script tracks top 10 processes internally but displays top 5 in logs for clarity
+- **Process Count:** The script tracks the top 10 CPU processes returned by the monitor and reports the top 5 heat culprits at the end
 - **Heat Score Tuning:** Advanced users can modify the heat score calculation weights in the `Get-HeatCulprits` function
 
 ### ChromeTabMonitor.ps1 Customization
@@ -140,8 +152,10 @@ When enabled, exports timestamped data including all process metrics for histori
 - **Performance Counter Issues:** Both scripts include fallbacks if performance counters are unavailable
 
 ### ThermalMonitor.ps1 Issues
-- **No Temperature Data:** Install Open Hardware Monitor or check if your system exposes ACPI thermal zones
+- **No Temperature Data:** Install and run LibreHardwareMonitor or Open Hardware Monitor, or check if your system exposes ACPI thermal zones
 - **No GPU Data:** Ensure you have Windows 10 build 17763+ with WDDM 2.0+ drivers
+- **No CPU Power/Fan Data:** These values require LibreHardwareMonitor or Open Hardware Monitor and may not be exposed by every laptop sensor controller
+- **High DPC/Interrupt Activity:** Update chipset, storage, network, audio, and graphics drivers; disconnect external devices to compare behavior
 
 ### ChromeTabMonitor.ps1 Issues
 - **No Chrome Processes Found:** Ensure Chrome is running before starting the monitor
